@@ -1,0 +1,58 @@
+name: AI Apply Patch
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  apply:
+    if: contains(github.event.comment.body, '/apply')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract diff block
+        id: extract
+        run: |
+          python - << 'PY'
+import os, re, sys
+body = os.environ['BODY']
+m = re.search(r"```diff(.*?)```", body, re.S|re.I)
+if not m:
+    print("::error::Не найден блок ```diff ... ``` в комментарии.")
+    sys.exit(1)
+patch = m.group(1).strip()
+open("ai_patch.diff","w",encoding="utf-8").write(patch+"\n")
+print("patch_file=ai_patch.diff", file=open(os.environ["GITHUB_OUTPUT"],"a"))
+PY
+        env:
+          BODY: ${{ github.event.comment.body }}
+
+      - name: Create branch
+        run: |
+          git config user.name "ai-patch-bot"
+          git config user.email "ai-patch-bot@users.noreply.github.com"
+          git checkout -b "ai/patch-${{ github.run_id }}"
+
+      - name: Apply patch
+        run: |
+          git apply --whitespace=fix ai_patch.diff
+          git add -A
+          git commit -m "AI patch ${{ github.run_id }}"
+
+      - name: Push branch
+        run: git push origin "ai/patch-${{ github.run_id }}"
+
+      - name: Open PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: "ai/patch-${{ github.run_id }}"
+          title: "AI patch ${{ github.run_id }}"
+          body: "PR создан автоматически из комментария с командой /apply."
