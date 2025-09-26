@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   apply:
-    # Запускаемся только если комментарий содержит /apply
+    # Запуск только если комментарий содержит /apply
     if: ${{ contains(github.event.comment.body, '/apply') }}
     runs-on: ubuntu-latest
 
@@ -19,45 +19,41 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Parse file blocks from comment
-        env:
-          BODY: ${{ github.event.comment.body }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p .agent
-          python3 - <<'PY'
-import os, re, json, sys
-body = os.environ.get("BODY","")
-# Формат блока: ```file=path/to/file\n<content>\n```
-blocks = re.findall(r"```file=([^\n]+)\n([\s\S]*?)```", body)
-if not blocks:
-    print("No file blocks found in comment", file=sys.stderr)
-paths = []
-for path, content in blocks:
-    path = path.strip()
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    paths.append(path)
-with open(".agent/files.json","w",encoding="utf-8") as f:
-    json.dump(paths,f)
-print("Parsed files:", paths)
-PY
+      - name: Parse file blocks and write files
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment.body || "";
+            const re = /```file=([^\n]+)\n([\s\S]*?)```/g;
+            const fs = require('fs');
+            const path = require('path');
+            const files = [];
+            let m;
+            while ((m = re.exec(body)) !== null) {
+              const p = m[1].trim();
+              const content = m[2];
+              const dir = path.dirname(p);
+              if (dir && dir !== '.') fs.mkdirSync(dir, { recursive: true });
+              fs.writeFileSync(p, content, 'utf8');
+              core.info(`Wrote ${p}`);
+              files.push(p);
+            }
+            if (files.length === 0) {
+              core.setFailed("No ```file=...``` blocks found in the comment");
+            }
+            core.setOutput('files', JSON.stringify(files));
 
-      - name: Ensure files parsed
-        shell: bash
+      - name: Verify parsed files
         run: |
-          test -f .agent/files.json || (echo "No files parsed." && exit 1)
-          cat .agent/files.json || true
+          echo "Files: ${{ steps.parse.outputs.files }}"
+          git status --porcelain
 
       - name: Create branch, commit, push
         id: commit
         env:
           BR: agent/${{ github.run_id }}
-        shell: bash
         run: |
-          set -euo pipefail
           git config user.name "repo-agent[bot]"
           git config user.email "repo-agent[bot]@users.noreply.github.com"
           git checkout -b "$BR"
@@ -79,11 +75,10 @@ PY
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const head = `agent/${{ github.run_id }}`;
-            const base = "${{ github.event.repository.default_branch }}"; // целевая ветка (дефолтная)
+            const base = context.payload.repository.default_branch; // целевая ветка = дефолтная
             const {owner, repo} = context.repo;
             const res = await github.rest.pulls.create({
-              owner, repo,
-              head, base,
+              owner, repo, head, base,
               title: "Agent: apply changes",
               body: "Автосоздано из комментария с `/apply`."
             });
