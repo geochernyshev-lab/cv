@@ -7,6 +7,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 jobs:
   apply:
@@ -25,23 +26,34 @@ jobs:
           script: |
             const fs = require('fs');
             const body = (context.payload.comment.body || '').trim();
+            // 1) fenced ```diff ...``` или ```patch ...```
             const fence = body.match(/```(?:diff|patch)?\s*([\s\S]*?)```/i);
             let diffText = '';
-            if (fence && fence[1]) diffText = fence[1].trim();
-            else {
+            if (fence && fence[1]) {
+              diffText = fence[1].trim();
+            } else {
+              // 2) фолбэк: всё после "diff --git"
               const i = body.indexOf('diff --git');
               if (i !== -1) diffText = body.slice(i).trim();
             }
-            if (!diffText) core.setFailed('Не найден патч. Вставь блок ```diff ...``` или начни с "diff --git".');
-            fs.writeFileSync('ai_patch.diff', diffText + '\n');
+            if (!diffText) {
+              core.setFailed('Не найден патч. Вставь блок ```diff ...``` или начни с "diff --git".');
+            } else {
+              fs.writeFileSync('ai_patch.diff', diffText + '\n');
+              core.info('Patch extracted OK');
+            }
 
       - name: Determine base branch
         id: base
-        run: echo "base=${GITHUB_REF_NAME:-${{ github.event.repository.default_branch }}}" >> $GITHUB_OUTPUT
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Явно берём дефолтную ветку репозитория
+            return { base: context.payload.repository.default_branch };
 
       - name: Create patch branch from base
         env:
-          BASE: ${{ steps.base.outputs.base || github.event.repository.default_branch }}
+          BASE: ${{ steps.base.outputs.result.base }}
         run: |
           git config user.name "ai-patch-bot"
           git config user.email "ai-patch-bot@users.noreply.github.com"
@@ -49,21 +61,55 @@ jobs:
           git pull --ff-only origin "$BASE"
           git checkout -b "ai/patch-${{ github.run_id }}" "$BASE"
 
-      - name: Apply patch
+      - name: Apply patch & commit
         run: |
+          set -e
           git apply --whitespace=fix ai_patch.diff
           git add -A
+          # Если изменений нет, git commit завершится с кодом 1 — тогда упадём, чтобы видеть в логах
           git commit -m "AI patch ${{ github.run_id }}"
 
       - name: Push branch
         run: git push -u origin "ai/patch-${{ github.run_id }}"
 
-      - name: Open PR
-        uses: peter-evans/create-pull-request@v6
+      - name: Create PR via API (robust)
+        id: makepr
+        uses: actions/github-script@v7
         with:
-          branch: "ai/patch-${{ github.run_id }}"
-          base: ${{ github.event.repository.default_branch }}
-          title: "AI patch ${{ github.run_id }}"
-          body: |
-            PR создан автоматически из комментария с командой /apply.
-            Источник: ${{ github.event.comment.html_url }}
+          script: |
+            const { owner, repo } = context.repo;
+            const base = context.payload.repository.default_branch;
+            const head = `ai/patch-${process.env.GITHUB_RUN_ID}`;
+
+            // Проверим, нет ли уже открытого PR с этой веткой
+            const prs = await github.rest.pulls.list({
+              owner, repo, state: 'open', head: `${owner}:${head}`
+            });
+            let pr;
+            if (prs.data.length > 0) {
+              pr = prs.data[0];
+            } else {
+              pr = (await github.rest.pulls.create({
+                owner, repo,
+                title: `AI patch ${process.env.GITHUB_RUN_ID}`,
+                head, base,
+                body: `PR создан автоматически из комментария: ${context.payload.comment.html_url}`
+              })).data;
+            }
+
+            core.setOutput('pr_number', pr.number);
+            core.setOutput('pr_url', pr.html_url);
+
+      - name: Comment back with PR link
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prUrl = '${{ steps.makepr.outputs.pr_url }}';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: prUrl
+                ? `✅ PR создан: ${prUrl}`
+                : '⚠️ PR не создан (смотри логи шага "Create PR via API (robust)")'
+            })
