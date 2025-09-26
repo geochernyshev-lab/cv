@@ -18,38 +18,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract diff block from comment
+      - name: Extract diff block
         id: extract
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
             const body = (context.payload.comment.body || '').trim();
-
-            // 1) Пытаемся найти fenced-блок ```diff ... ```
             const fence = body.match(/```(?:diff|patch)?\s*([\s\S]*?)```/i);
-
             let diffText = '';
-            if (fence && fence[1]) {
-              diffText = fence[1].trim();
-            } else {
-              // 2) Фолбэк: всё, что после первого "diff --git"
-              const idx = body.indexOf('diff --git');
-              if (idx !== -1) diffText = body.slice(idx).trim();
+            if (fence && fence[1]) diffText = fence[1].trim();
+            else {
+              const i = body.indexOf('diff --git');
+              if (i !== -1) diffText = body.slice(i).trim();
             }
+            if (!diffText) core.setFailed('Не найден патч. Вставь блок ```diff ...``` или начни с "diff --git".');
+            fs.writeFileSync('ai_patch.diff', diffText + '\n');
 
-            if (!diffText) {
-              core.setFailed('Не найден патч. Вставь блок ```diff ...``` или начни текст с "diff --git".');
-            } else {
-              fs.writeFileSync('ai_patch.diff', diffText + '\n');
-              core.info('Patch extracted OK');
-            }
+      - name: Determine base branch
+        id: base
+        run: echo "base=${GITHUB_REF_NAME:-${{ github.event.repository.default_branch }}}" >> $GITHUB_OUTPUT
 
-      - name: Create branch
+      - name: Create patch branch from base
+        env:
+          BASE: ${{ steps.base.outputs.base || github.event.repository.default_branch }}
         run: |
           git config user.name "ai-patch-bot"
           git config user.email "ai-patch-bot@users.noreply.github.com"
-          git checkout -b "ai/patch-${{ github.run_id }}"
+          git checkout "$BASE"
+          git pull --ff-only origin "$BASE"
+          git checkout -b "ai/patch-${{ github.run_id }}" "$BASE"
 
       - name: Apply patch
         run: |
@@ -58,12 +56,13 @@ jobs:
           git commit -m "AI patch ${{ github.run_id }}"
 
       - name: Push branch
-        run: git push origin "ai/patch-${{ github.run_id }}"
+        run: git push -u origin "ai/patch-${{ github.run_id }}"
 
       - name: Open PR
         uses: peter-evans/create-pull-request@v6
         with:
           branch: "ai/patch-${{ github.run_id }}"
+          base: ${{ github.event.repository.default_branch }}
           title: "AI patch ${{ github.run_id }}"
           body: |
             PR создан автоматически из комментария с командой /apply.
